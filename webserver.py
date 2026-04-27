@@ -6,25 +6,63 @@ import urllib.parse
 import hashlib
 import os
 import time
+import datetime
+from zoneinfo import ZoneInfo
 from periphery import GPIO
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+import base64
+
+# total count of restarts
+DEVICE_RESTART_TOTAL = Counter(
+    "device_restart_total",
+    "Total number of times the recorder has been restarted"
+)
+
+# Timestamp (epoch seconds) of the *last* restart
+DEVICE_LAST_RESTART = Gauge(
+    "device_last_restart_timestamp_seconds",
+    "Unix timestamp of the most recent restart"
+)
+
+DEVICE_LAST_RESTART_INFO = Gauge(
+    "device_last_restart_info",
+    "Human‑readable timestamp of the most recent restart ",
+    ["time"]
+)
+
 
 # Config
 PIN = 55
 GPIO_PIN = GPIO(PIN, "out")
-GPIO_PIN.write(False)
+GPIO_PIN.write(False)          
 
-with open("config.txt","r") as file:
+with open("config.txt", "r") as file:
     HOST = file.readline().strip()
     PORT = int(file.readline().strip())
     USERNAME = file.readline().strip()
-    PASSWORD = file.read().strip()
+    PASSWORD = file.readline().strip()
+    METRICS_USERNAME = file.readline().strip()
+    METRICS_PASSWORD = file.readline().strip()
 
 # Simple token store (token -> expiry timestamp)
 sessions = {}
 
+#Metrics basic auth, base64 encodes/decodes text to ASCII
+def check_basic_auth(headers):
+    auth = headers.get("Authorization")
+    if not auth:
+        return False
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode()
+        user, pw = decoded.split(":", 1)
+        return hash_data(user) == METRICS_USERNAME and hash_data(pw) == METRICS_PASSWORD
+    except:
+        return False
+
 def hash_data(data):
-    data_hash = hashlib.sha3_256(data.encode())
-    return data_hash.hexdigest()
+    return hashlib.sha3_256(data.encode()).hexdigest()
 
 def generate_token():
     return hashlib.sha256(os.urandom(32)).hexdigest()
@@ -40,14 +78,26 @@ def is_valid_session(cookie_header):
                 return True
     return False
 
-# button restart function
-def execute_action():
+# Restart function 
+def restart_capture_agent():
+    # Record when the restart was requested
+    now = time.time()
+    DEVICE_LAST_RESTART.set(now)
+    berlin_tz = ZoneInfo("Europe/Berlin")
+    iso_time = datetime.datetime.fromtimestamp(now,tz=berlin_tz).isoformat()
+    DEVICE_LAST_RESTART_INFO.labels(time=iso_time).set(1)
+
+    # Increment the total‑restart counter
+    DEVICE_RESTART_TOTAL.inc()
+
     GPIO_PIN.write(True)
+   
     time.sleep(20)
+    
     GPIO_PIN.write(False)
+
     return "Recorder is restarted!"
 
-    
 # HTML Pages
 LOGIN_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
@@ -104,21 +154,21 @@ function execute(){
     res.style.display = "none";
     res.textContent = "";
 
-    // change color
+    // change colour & disable while restarting
     btn.classList.add("active");
     btn.disabled = true;
     btn.textContent = "Restarting...";
 
-    // send request without reloading
+    // fire the POST request without a page reload
     fetch("/execute", {method: "POST"})
-        .then(function(r){ return r.text(); })
-        .then(function(text){
+        .then(r => r.text())
+        .then(text => {
             res.textContent = text;
             res.style.display = "block";
             btn.textContent = "Restart";
         });
 
-    // revert after 20 seconds
+    // Re‑enable after the 20 s restart window
     setTimeout(function(){
         btn.classList.remove("active");
         btn.disabled = false;
@@ -132,7 +182,7 @@ function execute(){
 
 # Handler
 class Handler(http.server.BaseHTTPRequestHandler):
-
+    
     def send_page(self, code, html):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -147,6 +197,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == "/metrics":
+            if not check_basic_auth(self.headers):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="Metrics"')
+                self.end_headers()
+                return
+            data = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        
         logged_in = is_valid_session(self.headers.get("Cookie"))
 
         if self.path == "/dashboard":
@@ -157,7 +220,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/logout":
             self.redirect("/", "token=; Max-Age=0")
 
-        else:  # "/" and everything else
+        else:   
             if logged_in:
                 return self.redirect("/dashboard")
             self.send_page(200, LOGIN_PAGE % "")
@@ -170,21 +233,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/login":
             user = params.get("username", [""])[0]
             pw   = params.get("password", [""])[0]
-            hashed_pw = hash_data(pw)
-            hashed_user = hash_data(user)
-            if hashed_user == USERNAME and hashed_pw == PASSWORD:
+            if (hash_data(user) == USERNAME and
+                hash_data(pw)   == PASSWORD):
                 token = generate_token()
-                sessions[token] = time.time() + 3600  # 1h
+                sessions[token] = time.time() + 3600   # 1 hour session
                 self.redirect("/dashboard",
                     f"token={token}; Path=/; Max-Age=3600")
             else:
-                self.send_page(200, LOGIN_PAGE %
-                    '<div class="err">Invalid credentials</div>')
+                self.send_page(200,
+                    LOGIN_PAGE % '<div class="err">Invalid credentials</div>')
 
         elif self.path == "/execute":
             if not is_valid_session(self.headers.get("Cookie")):
                 return self.redirect("/")
-            result = execute_action()
+            result = restart_capture_agent()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -193,16 +255,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.redirect("/")
 
-    # suppress console log noise
     def log_message(self, fmt, *args):
         pass
 
 def main():
-    # starting server 
     with socketserver.TCPServer((HOST, PORT), Handler) as s:
         print(f"Running on {HOST}:{PORT}")
         s.serve_forever()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
